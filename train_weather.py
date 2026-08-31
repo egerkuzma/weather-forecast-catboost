@@ -26,7 +26,6 @@ statistics) or real-time neighbouring station observations.
 Writes artifacts/ for plots.py to render; run `python plots.py` afterwards.
 """
 
-import csv
 import json
 from pathlib import Path
 
@@ -35,7 +34,7 @@ import pandas as pd
 from catboost import CatBoostRegressor
 from sklearn.metrics import mean_absolute_error
 
-DATA_PATH = Path("data.csv")
+STATION_PATH = Path("station.csv.gz")  # produced by fetch_station.py
 ERA5_PATH = Path("era5_grid.csv.gz")  # optional; produced by fetch_era5.py
 ARTIFACT_DIR = Path("artifacts")
 
@@ -63,92 +62,37 @@ NON_FEATURE_COLS = {OBSERVED, TARGET, TARGET_OBSERVED}
 # those rows would cost data for no gain.
 REQUIRED_COLS = ["temp", "pressure", "temp_lag_1", "temp_lag_24", "pressure_lag_24"]
 
-# RP5 spells the 16-point compass out in prose. DD is the direction the wind
-# blows *from*, in degrees clockwise from north.
-WIND_AZIMUTH = {
-    "north": 0,
-    "north-northeast": 22.5,
-    "north-east": 45,
-    "east-northeast": 67.5,
-    "east": 90,
-    "east-southeast": 112.5,
-    "south-east": 135,
-    "south-southeast": 157.5,
-    "south": 180,
-    "south-southwest": 202.5,
-    "south-west": 225,
-    "west-southwest": 247.5,
-    "west": 270,
-    "west-northwest": 292.5,
-    "north-west": 315,
-    "north-northwest": 337.5,
-}
-
 # Cloud cover (c) and visibility (VV) are parsed out of the RP5 export in earlier
 # revisions and were dropped: CatBoost importance ~0.3, and removing them moves
 # test MAE by 0.005 against a seed standard deviation of 0.008 -- i.e. nothing,
 # for ~25 lines of free-text parsing.
 
-# Kursk keeps Moscow time, which was UTC+4 until 26.10.2014 02:00 MSK and UTC+3
-# after. data.csv is stamped in local time, ERA5 in UTC, so the offset both
-# matters and *changes mid-dataset*. Verified empirically: correlation between
-# station and ERA5 centre temperature peaks at exactly these offsets (0.988/0.990).
-MSK_SWITCH_UTC = pd.Timestamp("2014-10-25 22:00")
 
-
-def parse_wind(direction: pd.Series, speed: pd.Series) -> tuple[pd.Series, pd.Series]:
-    """Convert prose wind direction + speed into u/v vector components.
+def parse_wind(azimuth: pd.Series, speed: pd.Series) -> tuple[pd.Series, pd.Series]:
+    """Convert wind direction (degrees the wind blows *from*) + speed into u/v.
 
     Advection depends on direction and strength together, and a raw azimuth in
     degrees wraps discontinuously at 0/360. Components avoid both problems.
-    "Calm" is a true zero vector; "variable" leaves direction undefined (NaN).
+    METAR reports calm as 0 kt with direction 0, which lands on a zero vector
+    by construction; variable wind leaves the direction missing (NaN).
     """
-    name = direction.str.extract(r"blowing from the ([a-z\-]+)$", expand=False)
-    azimuth = name.map(WIND_AZIMUTH)
-
     radians = np.deg2rad(azimuth.astype(float))
     u = -speed * np.sin(radians)  # eastward component
     v = -speed * np.cos(radians)  # northward component
-
-    calm = direction.str.startswith("Calm")
-    u[calm] = 0.0
-    v[calm] = 0.0
     return u, v
 
 
 def load_data(path: Path) -> pd.DataFrame:
-    """Load and clean the RP5 METAR export (semicolon-delimited with quotes).
+    """Load the UUOK METAR archive written by fetch_station.py.
 
-    Returns a contiguous hourly grid. Short gaps are interpolated so that lags
-    stay well-defined; the OBSERVED column records which hours are real
+    Returns a contiguous hourly grid in UTC. Short gaps are interpolated so that
+    lags stay well-defined; the OBSERVED column records which hours are real
     measurements rather than interpolated filler.
     """
-    df_raw = pd.read_csv(
-        path,
-        sep=";",
-        engine="python",
-        quoting=csv.QUOTE_NONE,
-        on_bad_lines="skip",
-    )
-
-    # Fixed-column selection by index: the header is unreliable (the whole record
-    # is wrapped in quotes, and the wind field may contain "Calm, no wind").
-    df = df_raw.iloc[:, [0, 1, 3, 4, 6, 12, 5]].copy()
-    df.columns = ["timestamp", "temp", "pressure", "humidity", "wind_speed", "dew_point",
-                  "wind_dir"]
-
-    # Strip quotes/spaces then convert
-    df = df.apply(lambda col: col.astype(str).str.replace('"', "", regex=False).str.strip())
-
-    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", dayfirst=True)
-    df = df.dropna(subset=["timestamp"])
-    df = df.set_index("timestamp").sort_index()
-
-    for col in ["temp", "pressure", "humidity", "wind_speed", "dew_point"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = pd.read_csv(path, parse_dates=["time"]).set_index("time").sort_index()
 
     # Derive the wind vector before resampling, so that the hourly mean averages
-    # vectors rather than compass labels.
+    # vectors rather than azimuths (which would average 350 and 10 into 180).
     df["wind_u"], df["wind_v"] = parse_wind(df["wind_dir"], df["wind_speed"])
     df = df[METEO_COLS]
 
@@ -169,14 +113,38 @@ def load_data(path: Path) -> pd.DataFrame:
 
 
 def load_era5(path: Path, grid_index: pd.DatetimeIndex) -> pd.DataFrame:
-    """Load the ERA5 grid and re-stamp it from UTC into Kursk local time."""
+    """Load the ERA5 grid. Both sides are UTC now, so no re-stamping is needed."""
     era = pd.read_csv(path, parse_dates=["time"]).set_index("time").sort_index()
-
-    offsets = np.where(era.index < MSK_SWITCH_UTC, 4, 3)
-    era.index = era.index + pd.to_timedelta(offsets, unit="h")
     era = era[~era.index.duplicated(keep="first")]
-
     return era.reindex(grid_index)
+
+
+def check_alignment(df: pd.DataFrame, max_lag: int = 3, margin: float = 0.1) -> None:
+    """Fail loudly if the station and ERA5 are not on the same clock.
+
+    Correlating raw temperatures cannot do this: the daily cycle makes adjacent
+    hours nearly indistinguishable, and the peak is flat to the fourth decimal.
+    Correlating hourly *increments* removes the cycle and leaves frontal noise,
+    which does have a peak. Measured on 2013-2025: lag 0 scores ~0.66-0.72 and
+    +-2h scores ~0.43-0.53, so the check comfortably catches a timezone shift.
+    It is not an hour-precision instrument -- lag +-1h sits only 0.03-0.06 below
+    lag 0 -- and it is not meant to be.
+    """
+    if "era5_temp_center" not in df.columns:
+        return
+
+    station = df.loc[df[OBSERVED], "temp"].diff()
+    era = df["era5_temp_center"].diff()
+    scores = {lag: float(station.corr(era.shift(-lag))) for lag in range(-max_lag, max_lag + 1)}
+
+    best = max(scores, key=scores.get)
+    edge = max(scores[-max_lag + 1], scores[max_lag - 1])
+    if best != 0 or scores[0] - edge < margin:
+        table = "  ".join(f"{lag:+d}:{score:.3f}" for lag, score in sorted(scores.items()))
+        raise ValueError(
+            f"Station and ERA5 look misaligned -- increment correlation peaks at "
+            f"{best:+d}h, not 0h. Both sources must be UTC.\n  {table}"
+        )
 
 
 def add_era5_features(feat: pd.DataFrame) -> pd.DataFrame:
@@ -251,7 +219,7 @@ def split_labeled(df: pd.DataFrame) -> pd.DataFrame:
 
 def build_dataset(era5_lag_hours: int | None = 0) -> pd.DataFrame:
     """Station grid joined with ERA5. era5_lag_hours=None skips ERA5 entirely."""
-    df = load_data(DATA_PATH)
+    df = load_data(STATION_PATH)
 
     if era5_lag_hours is not None and ERA5_PATH.exists():
         era = load_era5(ERA5_PATH, df.index)
@@ -260,6 +228,25 @@ def build_dataset(era5_lag_hours: int | None = 0) -> pd.DataFrame:
         df = df.join(era)
 
     return add_features(df)
+
+
+def coverage_by_year(df: pd.DataFrame) -> pd.DataFrame:
+    """How much of each year the station actually reported, day and night.
+
+    This belongs in the log rather than in a comment, because the station's
+    schedule changed: night hours (00-04 UTC) are 5 of 24, i.e. 20.8% under even
+    coverage, but they are only ~16% before 2021 and ~22% after. Training years
+    are therefore daylight-biased relative to the test years, and a schedule
+    change is otherwise invisible -- the sample just quietly shrinks or grows.
+    """
+    observed = df[OBSERVED]
+    night = df.index.hour < 5
+    return pd.DataFrame({
+        "hours": observed.groupby(df.index.year).size(),
+        "observed": observed.groupby(df.index.year).mean(),
+        "night_share": observed[night].groupby(df.index[night].year).sum()
+        / observed.groupby(df.index.year).sum(),
+    })
 
 
 def make_model() -> CatBoostRegressor:
@@ -287,8 +274,8 @@ def baseline_predictions(test_df: pd.DataFrame) -> dict[str, pd.Series]:
 
 
 def main() -> None:
-    if not DATA_PATH.exists():
-        raise FileNotFoundError(f"Data file not found: {DATA_PATH}")
+    if not STATION_PATH.exists():
+        raise FileNotFoundError(f"Station archive not found: {STATION_PATH} (run fetch_station.py)")
     ARTIFACT_DIR.mkdir(exist_ok=True)
 
     df = build_dataset()
@@ -296,6 +283,13 @@ def main() -> None:
     print(f"Hourly grid: {len(df):,} rows ({df.index.min()} -> {df.index.max()})")
     print(f"Genuinely measured hours: {df[OBSERVED].sum():,} ({df[OBSERVED].mean() * 100:.1f}%)")
     print(f"ERA5 grid: {'joined' if has_era5 else 'ABSENT (run fetch_era5.py)'}")
+
+    check_alignment(df)
+
+    coverage = coverage_by_year(df)
+    print("\nStation coverage by year (night = 00-04 UTC, 20.8% under even coverage):")
+    for year, row in coverage.iterrows():
+        print(f"  {year}  observed {row['observed'] * 100:5.1f}%   night {row['night_share'] * 100:5.1f}%")
 
     labeled = split_labeled(df)
     train_df = labeled.loc[labeled.index < VAL_START]

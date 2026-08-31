@@ -1,7 +1,7 @@
 # Kursk 24-hour temperature forecast
 
 Gradient-boosted 24-hour-ahead temperature forecasting for Kursk airport (UUOK),
-trained on 13 years of RP5 METAR observations and evaluated against the trivial
+trained on 13 years of METAR observations and evaluated against the trivial
 baselines any weather model has to beat.
 
 The headline number is **2.01 °C MAE** — but the more interesting result is that
@@ -97,33 +97,42 @@ single-station model cannot anticipate.
 
 ## Data quirks worth knowing
 
-Three things in this dataset silently corrupt a naive pipeline. All are handled in
+Four things in this dataset silently corrupt a naive pipeline. All are handled in
 `train_weather.py`, and all were found the hard way.
 
-**The station sleeps at night.** Kursk airport reports ~hourly by day but goes quiet
-for ~6 hours most nights (1,475 gaps of exactly 6h; hours 00–04 have ~3,400
-observations against ~7,600 at midday). A plain `ffill()` onto an hourly grid
+**The station used to sleep at night.** Until 2021 Kursk airport reported ~hourly
+by day and then went quiet for ~6 hours most nights; since 2021 it reports around
+the clock. A plain `ffill()` onto an hourly grid
 therefore *invents* a flat temperature all night and erases the nocturnal minimum —
 and then the model both trains and scores on fiction. Here the grid is interpolated
 in time so lags stay defined, but an `temp_observed` flag records which hours are
 real, and **training and scoring use only rows measured at both feature time and
 target time**.
 
-**The UTC offset changes mid-dataset.** Kursk keeps Moscow time, which was UTC+4
-until 2014-10-26 and UTC+3 after; `data.csv` is stamped local, ERA5 is UTC. Joining
-them naively misaligns by 3–4 hours *with a jump in the middle*. The offsets are
-verified empirically — station↔ERA5 correlation peaks at exactly −4h and −3h
-(0.988 / 0.990).
+**Clocks have to be checked, not assumed.** The RP5 export was stamped in local
+time — Moscow time, which was UTC+4 until 2014-10-26 and UTC+3 after — so joining
+it to ERA5 misaligned by 3–4 hours *with a jump in the middle*. The ASOS archive
+is UTC throughout and the offset code is gone, but the assumption is now enforced
+rather than trusted: `check_alignment` correlates hourly *increments* between the
+station and ERA5 and fails unless the peak sits at lag 0. Increments, not raw
+temperatures — the daily cycle makes adjacent hours indistinguishable, and on raw
+values the peak is flat to the fourth decimal.
 
 **`shift(24)` is positional, not temporal.** It means "24 hours" only while the
 index is a contiguous hourly grid. Drop rows before building lags and it silently
 becomes "24 rows" — an arbitrary interval. Hence the ordering in `load_data`:
 resample → interpolate → lag → *then* filter.
 
-The RP5 export is also a genuinely awkward file: the whole record is wrapped in
-quotes, fields are `;`-separated inside it, and the wind field may itself contain
-`"Calm, no wind"`. Columns are selected by index, not header, and `QUOTE_NONE`
-parsing loses only 5 of 156,493 lines.
+**The station's schedule changed.** `train_weather.py` prints coverage per year,
+because it is not stable: reported hours go from ~55–60% before 2021 to ~99% after,
+and the night share (00–04 UTC, 20.8% of hours under even coverage) from ~16% to
+~21%. Training years are therefore daylight-biased relative to the test years —
+worth knowing before attributing a metric change to the model.
+
+The awkward RP5 parsing this file used to carry — the whole record wrapped in
+quotes, `;`-separated fields inside it, a wind column that could contain
+`"Calm, no wind"`, columns selected by index because the header was unreliable —
+is gone with the export. ASOS serves plain CSV with numeric wind direction.
 
 ## Setup
 
@@ -135,6 +144,7 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
+python fetch_station.py  # download the UUOK METAR archive (~20 s)
 python fetch_era5.py     # download the ERA5 upwind grid (~3 min, optional)
 python train_weather.py  # train, evaluate, write artifacts/
 python ablation.py       # regenerate the ERA5 honesty table (~5 min)
@@ -161,9 +171,12 @@ perfectly.
 
 Not redistributed here; both sources are free to fetch yourself.
 
-- **Station observations** — [RP5.ru](https://rp5.ru) weather archive for
-  Kursk (airport), METAR format, 2012-09-26 → 2025-12-10. Export as CSV (UTF-8)
-  and save as `data.csv`. Data provided by rp5.ru; their terms govern reuse.
+- **Station observations** — UUOK (Kursk airport) METAR, 2012-09-26 → 2025-12-10,
+  fetched by `fetch_station.py` from the
+  [Iowa State ASOS archive](https://mesonet.agron.iastate.edu/request/download.phtml)
+  (free, no key). Earlier revisions used a hand-exported `data.csv` from
+  [RP5.ru](https://rp5.ru); the reports are the same, but RP5 is only reachable
+  through a web form and is stamped in local time.
 - **ERA5 reanalysis** — fetched by `fetch_era5.py` from the
   [Open-Meteo archive API](https://open-meteo.com/) (free, no key). Generated by
   Copernicus Climate Change Service information.
